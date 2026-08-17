@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1694,17 +1695,41 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 // bakeToolResultsIntoTurns merges tool results into the last turn's assistant text
 // when there's no active H2 session to resume. This ensures the model sees the
 // full tool interaction context in a new conversation.
-// flattenConversationIntoUserText flattens the full conversation history
-// (turns + tool results) into the UserText field as plain text.
-// This is the fallback for cold resume when no checkpoint is available.
-// Cursor reliably reads UserText but ignores structured turns.
+// flattenConversationIntoUserText rebuilds a cold continuation from the
+// conversation history. Agent clients resend the complete transcript on every
+// tool round, so replaying every historic tool call/result as the current user
+// message makes Cursor treat completed work as fresh instructions. That grows
+// quadratically and can push models into repeated todo/tool/narrator loops.
+//
+// Preserve normal user/assistant turns for context, but expose only results
+// matching the most recent assistant tool-call set as pending observations.
+// Some clients append their complete tool-result history as one trailing block,
+// so position alone cannot distinguish fresh results from completed work.
 func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
-	var buf strings.Builder
+	latestToolCallIndex := -1
+	pendingToolIDs := make(map[string]struct{})
+	for index := len(parsed.Messages) - 1; index >= 0; index-- {
+		message := parsed.Messages[index]
+		if message.Get("role").String() != "assistant" {
+			continue
+		}
+		toolCalls := message.Get("tool_calls").Array()
+		if len(toolCalls) == 0 {
+			continue
+		}
+		latestToolCallIndex = index
+		for _, toolCall := range toolCalls {
+			if id := toolCall.Get("id").String(); id != "" {
+				pendingToolIDs[id] = struct{}{}
+			}
+		}
+		break
+	}
 
-	// Render from the original messages so assistant tool calls and tool results
-	// retain their exact chronological relationship. Cursor imposes no smaller
-	// request limit here, so results remain complete.
-	for _, message := range parsed.Messages {
+	knownToolCallIDs := make(map[string]struct{})
+	satisfiedToolCallIDs := make(map[string]struct{})
+	var buf strings.Builder
+	for index, message := range parsed.Messages {
 		role := message.Get("role").String()
 		switch role {
 		case "system":
@@ -1713,31 +1738,62 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 			writeCursorTranscriptEntry(&buf, "USER", extractTextContent(message.Get("content")))
 		case "assistant":
 			writeCursorTranscriptEntry(&buf, "ASSISTANT", extractTextContent(message.Get("content")))
+			pending := index == latestToolCallIndex
+			label := "COMPLETED_TOOL_CALL"
+			if pending {
+				label = "PENDING_TOOL_CALL"
+			}
 			for _, toolCall := range message.Get("tool_calls").Array() {
+				id := toolCall.Get("id").String()
 				entry, _ := json.Marshal(map[string]string{
-					"id":        toolCall.Get("id").String(),
+					"id":        id,
 					"name":      toolCall.Get("function.name").String(),
 					"arguments": toolCall.Get("function.arguments").String(),
 				})
-				writeCursorTranscriptEntry(&buf, "ASSISTANT_TOOL_CALL", string(entry))
+				if id != "" {
+					knownToolCallIDs[id] = struct{}{}
+				}
+				writeCursorTranscriptEntry(&buf, label, string(entry))
 			}
 		case "tool":
+			toolCallID := message.Get("tool_call_id").String()
+			label := "COMPLETED_TOOL_RESULT"
+			if _, pending := pendingToolIDs[toolCallID]; pending {
+				label = "PENDING_TOOL_RESULT"
+			}
+			if toolCallID != "" {
+				satisfiedToolCallIDs[toolCallID] = struct{}{}
+			}
 			entry, _ := json.Marshal(map[string]string{
-				"tool_call_id": message.Get("tool_call_id").String(),
+				"tool_call_id": toolCallID,
 				"content":      extractTextContent(message.Get("content")),
 			})
-			writeCursorTranscriptEntry(&buf, "TOOL_RESULT", string(entry))
+			writeCursorTranscriptEntry(&buf, label, string(entry))
 		}
 	}
 
 	if buf.Len() > 0 {
-		buf.WriteString("The above is the previous conversation context including tool call results.\n")
-		buf.WriteString("Continue your response based on this context.\n\n")
+		outstanding := make([]string, 0, len(knownToolCallIDs))
+		for id := range knownToolCallIDs {
+			if _, done := satisfiedToolCallIDs[id]; !done {
+				outstanding = append(outstanding, id)
+			}
+		}
+		sort.Strings(outstanding)
+
+		buf.WriteString("The transcript above is the full conversation history, including every tool call you already made and its result.\n")
+		buf.WriteString("COMPLETED_TOOL_CALL / COMPLETED_TOOL_RESULT entries are finished work: their content is authoritative and must be reused from the transcript, never re-fetched.\n")
+		buf.WriteString("PENDING_TOOL_CALL / PENDING_TOOL_RESULT entries are the most recent step.\n")
+		buf.WriteString("Never call a tool again when a result for the same request is already present above.\n")
+		if len(outstanding) == 0 {
+			buf.WriteString("Every tool call in this conversation already has its result. Do not call any tool; produce the final answer now using the transcript content.\n")
+		} else {
+			buf.WriteString("Tool calls still awaiting a result: " + strings.Join(outstanding, ", ") + ".\n")
+		}
+		buf.WriteString("If the requested work is complete, return the final answer immediately.\n")
 	}
 
-	parsed.UserText = buf.String() + "Continue from the conversation above."
-
-	// Clear turns and tool results since they're now in UserText
+	parsed.UserText = buf.String()
 	parsed.Turns = nil
 	parsed.ToolResults = nil
 }

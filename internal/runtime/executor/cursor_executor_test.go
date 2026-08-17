@@ -338,7 +338,7 @@ func TestParseOpenAIToolCallIDDoesNotDoubleNormalize(t *testing.T) {
 	}
 }
 
-func TestFlattenConversationIntoUserTextPreservesToolResult(t *testing.T) {
+func TestFlattenConversationIntoUserTextPreservesPendingToolResult(t *testing.T) {
 	parsed := parseOpenAIRequest([]byte(`{
 		"messages": [
 			{"role":"user","content":"Read the project file."},
@@ -351,9 +351,9 @@ func TestFlattenConversationIntoUserTextPreservesToolResult(t *testing.T) {
 	for _, want := range []string{
 		"USER: Read the project file.",
 		"ASSISTANT: I will read it.",
-		`ASSISTANT_TOOL_CALL: {"arguments":"{\"path\":\"README.md\"}","id":"call_read","name":"read"}`,
-		`TOOL_RESULT: {"content":"project contents","tool_call_id":"call_read"}`,
-		"Continue your response based on this context.",
+		`PENDING_TOOL_CALL: {"arguments":"{\"path\":\"README.md\"}","id":"call_read","name":"read"}`,
+		`PENDING_TOOL_RESULT: {"content":"project contents","tool_call_id":"call_read"}`,
+		"Never call a tool again when a result for the same request is already present above.",
 	} {
 		if !strings.Contains(parsed.UserText, want) {
 			t.Fatalf("flattened transcript is missing %q: %q", want, parsed.UserText)
@@ -364,32 +364,97 @@ func TestFlattenConversationIntoUserTextPreservesToolResult(t *testing.T) {
 	}
 }
 
-func TestFlattenConversationIntoUserTextPreservesToolCallOrderAndCompleteUTF8Result(t *testing.T) {
-	largeResult := strings.Repeat("🙂", 3000)
+func TestFlattenConversationIntoUserTextKeepsCompletedToolWork(t *testing.T) {
+	oldResult := strings.Repeat("old-result-🙂", 3000)
 	payload := []byte(`{"messages":[` +
-		`{"role":"user","content":"run both"},` +
+		`{"role":"user","content":"finish the task"},` +
+		`{"role":"assistant","tool_calls":[{"id":"call_old","type":"function","function":{"name":"todo_write","arguments":"{\"item\":\"old\"}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_old","content":` + jsonString(oldResult) + `},` +
+		`{"role":"assistant","content":"The old todo is complete."},` +
 		`{"role":"assistant","tool_calls":[` +
-		`{"id":"call_first","type":"function","function":{"name":"first","arguments":"{\"n\":1}"}},` +
-		`{"id":"call_second","type":"function","function":{"name":"second","arguments":"{\"n\":2}"}}]},` +
-		`{"role":"tool","tool_call_id":"call_first","content":` + jsonString(largeResult) + `},` +
-		`{"role":"tool","tool_call_id":"call_second","content":"done"}` +
+		`{"id":"call_latest_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},` +
+		`{"id":"call_latest_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"b\"}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_latest_a","content":"latest-a"},` +
+		`{"role":"tool","tool_call_id":"call_latest_b","content":"latest-b"}` +
 		`]}`)
 	parsed := parseOpenAIRequest(payload)
 
 	flattenConversationIntoUserText(parsed)
 
-	first := strings.Index(parsed.UserText, `"id":"call_first"`)
-	second := strings.Index(parsed.UserText, `"id":"call_second"`)
-	firstResult := strings.Index(parsed.UserText, `"tool_call_id":"call_first"`)
-	secondResult := strings.Index(parsed.UserText, `"tool_call_id":"call_second"`)
-	if first < 0 || second <= first || firstResult <= second || secondResult <= firstResult {
-		t.Fatalf("tool call/result order was not preserved: first=%d second=%d firstResult=%d secondResult=%d", first, second, firstResult, secondResult)
+	// Every prior tool call AND its result must survive: dropping them caused the
+	// model to lose earlier work and re-issue the same tool call in a loop.
+	for _, want := range []string{
+		"call_latest_a", "call_latest_b", "latest-a", "latest-b",
+		"The old todo is complete.",
+		"call_old", "todo_write", oldResult,
+		"PENDING_TOOL_CALL", "COMPLETED_TOOL_CALL", "COMPLETED_TOOL_RESULT",
+	} {
+		if !strings.Contains(parsed.UserText, want) {
+			t.Fatalf("flattened transcript is missing %q", want)
+		}
 	}
-	if !strings.Contains(parsed.UserText, largeResult) || !strings.Contains(parsed.UserText, `"name":"first"`) || !strings.Contains(parsed.UserText, `"arguments":"{\"n\":1}"`) {
-		t.Fatal("flattened transcript lost tool metadata or complete UTF-8 result")
+	if !strings.Contains(parsed.UserText, "Every tool call in this conversation already has its result.") {
+		t.Fatal("transcript should tell the model no tool call is outstanding")
 	}
-	if !utf8.ValidString(parsed.UserText) || strings.Contains(parsed.UserText, "[truncated]") {
-		t.Fatal("flattened transcript truncated or corrupted UTF-8")
+	if !utf8.ValidString(parsed.UserText) {
+		t.Fatal("flattened transcript is invalid UTF-8")
+	}
+}
+
+func TestFlattenConversationIntoUserTextLabelsHistoryAndKeepsEveryResult(t *testing.T) {
+	payload := []byte(`{"messages":[` +
+		`{"role":"user","content":"fetch three pages"},` +
+		`{"role":"assistant","tool_calls":[{"id":"call_old","type":"function","function":{"name":"fetch_url","arguments":"{\"page\":1}"}}]},` +
+		`{"role":"assistant","content":"Page 1 is complete."},` +
+		`{"role":"assistant","tool_calls":[{"id":"call_latest","type":"function","function":{"name":"fetch_url","arguments":"{\"page\":3}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_old","content":"historical page one"},` +
+		`{"role":"tool","tool_call_id":"call_latest","content":"fresh page three"}` +
+		`]}`)
+	parsed := parseOpenAIRequest(payload)
+
+	flattenConversationIntoUserText(parsed)
+
+	// The older page-1 result must stay in the transcript, otherwise the model no
+	// longer knows page 1 was fetched and calls fetch_url for it again.
+	for _, want := range []string{
+		"call_latest", "fresh page three", "Page 1 is complete.",
+		"call_old", "historical page one",
+	} {
+		if !strings.Contains(parsed.UserText, want) {
+			t.Fatalf("flattened transcript is missing %q: %q", want, parsed.UserText)
+		}
+	}
+	// The newest step is PENDING, the earlier one is COMPLETED.
+	if !strings.Contains(parsed.UserText, `PENDING_TOOL_CALL: {"arguments":"{\"page\":3}","id":"call_latest","name":"fetch_url"}`) {
+		t.Fatalf("latest tool call should be PENDING: %q", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, `COMPLETED_TOOL_CALL: {"arguments":"{\"page\":1}","id":"call_old","name":"fetch_url"}`) {
+		t.Fatalf("older tool call should be COMPLETED: %q", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, `COMPLETED_TOOL_RESULT: {"content":"historical page one","tool_call_id":"call_old"}`) {
+		t.Fatalf("older result should be COMPLETED: %q", parsed.UserText)
+	}
+}
+
+func TestFlattenConversationIntoUserTextReportsOutstandingToolCall(t *testing.T) {
+	// A tool call with no matching result must be reported as outstanding so the
+	// model knows it still has work, instead of guessing.
+	payload := []byte(`{"messages":[` +
+		`{"role":"user","content":"fetch two pages"},` +
+		`{"role":"assistant","tool_calls":[` +
+		`{"id":"call_done","type":"function","function":{"name":"fetch_url","arguments":"{\"page\":1}"}},` +
+		`{"id":"call_waiting","type":"function","function":{"name":"fetch_url","arguments":"{\"page\":2}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_done","content":"page one body"}` +
+		`]}`)
+	parsed := parseOpenAIRequest(payload)
+
+	flattenConversationIntoUserText(parsed)
+
+	if !strings.Contains(parsed.UserText, "Tool calls still awaiting a result: call_waiting.") {
+		t.Fatalf("outstanding tool call not reported: %q", parsed.UserText)
+	}
+	if strings.Contains(parsed.UserText, "Every tool call in this conversation already has its result.") {
+		t.Fatalf("transcript wrongly claims all tool calls are satisfied: %q", parsed.UserText)
 	}
 }
 
