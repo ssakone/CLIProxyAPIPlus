@@ -1329,7 +1329,12 @@ func processH2SessionFrames(
 	onCheckpoint func(data []byte), // called when server sends conversation_checkpoint_update
 ) error {
 	var buf bytes.Buffer
-	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
+	// Native Cursor exec (read/write/ls/grep/shell/fetch) is not available here:
+	// only the client's own tools, exposed over MCP, can run. A bare "not
+	// available" answer left the model guessing, so it retried native exec in a
+	// read-only loop and never reached the implementing step. Name the tools it
+	// may actually call instead.
+	rejectReason := buildExecRejectReason(mcpTools)
 	log.Debugf("cursor: processH2SessionFrames started for streamID=%s, waiting for data...", stream.ID())
 	idleTimer := time.NewTimer(cursorFrameIdleTimeout)
 	defer idleTimer.Stop()
@@ -1890,17 +1895,106 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 		BlobStore:      make(map[string][]byte),
 	}
 
-	// Convert OpenAI tools to McpToolDefs
+	// Convert OpenAI tools to McpToolDefs.
+	//
+	// Clients disagree on the tool shape: Chat Completions nests everything under
+	// "function", while the Responses API (codex CLI, several SDKs) puts name,
+	// description and parameters at the top level. Reading only "function.name"
+	// produced tools with an EMPTY name, so the model emitted nameless tool calls
+	// that no client could match - the agent then retried forever without ever
+	// applying a change. Accept both shapes and never emit a nameless tool.
+	seenToolNames := make(map[string]struct{}, len(parsed.Tools))
 	for _, tool := range parsed.Tools {
-		fn := tool.Get("function")
-		params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
-			Name:        fn.Get("name").String(),
-			Description: fn.Get("description").String(),
-			InputSchema: json.RawMessage(fn.Get("parameters").Raw),
-		})
+		def, ok := normalizeOpenAIToolDef(tool)
+		if !ok {
+			log.Warnf("cursor: skipping tool with no usable name: %s", truncateForLog(tool.Raw, 200))
+			continue
+		}
+		if _, dup := seenToolNames[def.Name]; dup {
+			log.Warnf("cursor: skipping duplicate tool definition %q", def.Name)
+			continue
+		}
+		seenToolNames[def.Name] = struct{}{}
+		params.McpTools = append(params.McpTools, def)
 	}
 
 	return params
+}
+
+// buildExecRejectReason explains why native Cursor exec is unavailable and
+// lists the client tools the model can call instead, so it stops retrying
+// native exec and switches to the real tools.
+func buildExecRejectReason(mcpTools []cursorproto.McpToolDef) string {
+	names := make([]string, 0, len(mcpTools))
+	for _, t := range mcpTools {
+		if n := strings.TrimSpace(t.Name); n != "" {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return "Built-in tools are not available in this environment and no external " +
+			"tools were provided. Do not retry any tool call: answer directly with text."
+	}
+	return "Built-in tools (read, write, ls, grep, shell, fetch) are not available in " +
+		"this environment. Do not retry them. The only callable tools are: " +
+		strings.Join(names, ", ") +
+		". Call one of these by name to make progress, and apply changes rather than " +
+		"only inspecting."
+}
+
+// emptyToolInputSchema is used when a client omits "parameters" or sends a
+// schema that is not a JSON object. Cursor requires a valid object schema.
+const emptyToolInputSchema = `{"type":"object","properties":{}}`
+
+// normalizeOpenAIToolDef converts one client tool definition into an
+// McpToolDef, accepting both the nested Chat Completions shape
+// ({"type":"function","function":{"name":...}}) and the flat Responses shape
+// ({"type":"function","name":...}). It reports false when no name can be
+// resolved, so the caller can drop the tool instead of forwarding a nameless
+// one that the model would call and the client could never execute.
+func normalizeOpenAIToolDef(tool gjson.Result) (cursorproto.McpToolDef, bool) {
+	fields := tool
+	if fn := tool.Get("function"); fn.Exists() && fn.IsObject() {
+		fields = fn
+	}
+
+	name := strings.TrimSpace(fields.Get("name").String())
+	if name == "" {
+		// Some clients nest the callable under "custom" (custom tool type).
+		if custom := tool.Get("custom"); custom.Exists() && custom.IsObject() {
+			fields = custom
+			name = strings.TrimSpace(fields.Get("name").String())
+		}
+	}
+	if name == "" {
+		return cursorproto.McpToolDef{}, false
+	}
+
+	schema := fields.Get("parameters")
+	if !schema.Exists() || !schema.IsObject() {
+		// Responses-style clients may call it input_schema.
+		schema = fields.Get("input_schema")
+	}
+	raw := emptyToolInputSchema
+	if schema.Exists() && schema.IsObject() {
+		if trimmed := strings.TrimSpace(schema.Raw); trimmed != "" {
+			raw = trimmed
+		}
+	}
+
+	return cursorproto.McpToolDef{
+		Name:        name,
+		Description: strings.TrimSpace(fields.Get("description").String()),
+		InputSchema: json.RawMessage(raw),
+	}, true
+}
+
+// truncateForLog keeps diagnostic log lines bounded.
+func truncateForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // --- Helpers ---

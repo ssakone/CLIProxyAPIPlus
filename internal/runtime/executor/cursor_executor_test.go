@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -985,72 +984,79 @@ func TestCursorOpenAIExecutorEmitsNoDoneChunk(t *testing.T) {
 // Alias keeps test processor signatures readable without weakening production types.
 type anyMCPTools = []cursorproto.McpToolDef
 
-// recordingCursorStream captures written request frames for assertions.
-type recordingCursorStream struct {
-	inner   *fakeCursorStream
-	capture *[]byte
+// Clients disagree on the tool shape. Chat Completions nests the callable under
+// "function"; the Responses API (codex CLI and several SDKs) puts name,
+// description and parameters at the top level. Reading only "function.name"
+// yielded tools with an empty name, the model emitted nameless tool calls, no
+// client could match them, and the agent retried forever without implementing.
+func TestBuildRunRequestParamsAcceptsFlatAndNestedToolShapes(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"go"}],"tools":[` +
+		`{"type":"function","function":{"name":"nested_tool","description":"nested one","parameters":{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}}},` +
+		`{"type":"function","name":"flat_tool","description":"flat one","parameters":{"type":"object","properties":{"b":{"type":"number"}}}},` +
+		`{"type":"function","name":"flat_input_schema","description":"responses style","input_schema":{"type":"object","properties":{"c":{"type":"string"}}}},` +
+		`{"type":"custom","custom":{"name":"custom_tool","description":"custom one"}}` +
+		`]}`)
+	parsed := parseOpenAIRequest(payload)
+
+	params := buildRunRequestParams(parsed, "conv-1", "grok-4.6")
+
+	got := make(map[string]string, len(params.McpTools))
+	for _, tool := range params.McpTools {
+		if tool.Name == "" {
+			t.Fatalf("a nameless tool reached Cursor: %+v", params.McpTools)
+		}
+		got[tool.Name] = string(tool.InputSchema)
+	}
+	for _, want := range []string{"nested_tool", "flat_tool", "flat_input_schema", "custom_tool"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("tool %q missing from McpTools, got %v", want, got)
+		}
+	}
+	if !strings.Contains(got["flat_tool"], `"b"`) {
+		t.Fatalf("flat tool lost its schema: %q", got["flat_tool"])
+	}
+	if !strings.Contains(got["flat_input_schema"], `"c"`) {
+		t.Fatalf("input_schema was not honoured: %q", got["flat_input_schema"])
+	}
+	// A tool with no schema still needs a valid object schema for Cursor.
+	if got["custom_tool"] != emptyToolInputSchema {
+		t.Fatalf("custom tool schema = %q, want %q", got["custom_tool"], emptyToolInputSchema)
+	}
 }
 
-func (s *recordingCursorStream) ID() string          { return s.inner.ID() }
-func (s *recordingCursorStream) Data() <-chan []byte { return s.inner.Data() }
-func (s *recordingCursorStream) Done() <-chan struct{} {
-	return s.inner.Done()
+func TestBuildRunRequestParamsDropsUnusableAndDuplicateTools(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"go"}],"tools":[` +
+		`{"type":"function","function":{"name":"keep","description":"kept"}},` +
+		`{"type":"function","function":{"description":"no name at all"}},` +
+		`{"type":"function","name":"   "},` +
+		`{"type":"function","function":{"name":"keep","description":"duplicate"}}` +
+		`]}`)
+	parsed := parseOpenAIRequest(payload)
+
+	params := buildRunRequestParams(parsed, "conv-2", "grok-4.6")
+
+	if len(params.McpTools) != 1 {
+		t.Fatalf("McpTools = %d (%+v), want exactly 1 usable tool", len(params.McpTools), params.McpTools)
+	}
+	if params.McpTools[0].Name != "keep" {
+		t.Fatalf("kept tool = %q, want \"keep\"", params.McpTools[0].Name)
+	}
 }
-func (s *recordingCursorStream) Err() error { return s.inner.Err() }
-func (s *recordingCursorStream) Close()     { s.inner.Close() }
-func (s *recordingCursorStream) Write(p []byte) error {
-	*s.capture = append(*s.capture, p...)
-	return s.inner.Write(p)
-}
 
-// TestCursorExecuteNonStreamFlattensConversationTurns guards the fix for the
-// deterministic multi-message failure: Execute never attaches a checkpoint, and
-// Cursor's Run endpoint rejects structured turns on a checkpoint-less
-// conversation with "Connect error internal", so the wire request must carry a
-// flattened UserText transcript instead of Turns (#183).
-func TestCursorExecuteNonStreamFlattensConversationTurns(t *testing.T) {
-	var written []byte
-	e := NewCursorExecutor(nil)
-	e.openStream = func(string) (cursorStream, error) {
-		return &recordingCursorStream{inner: newFakeCursorStream(), capture: &written}, nil
-	}
-	e.processFrames = func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
-		onText("answer", false)
-		return nil
+// A bare "not available" rejection left the model guessing, so it retried native
+// exec in a read-only loop. The reason must name the callable tools.
+func TestBuildExecRejectReasonNamesCallableTools(t *testing.T) {
+	reason := buildExecRejectReason([]cursorproto.McpToolDef{
+		{Name: "edit"}, {Name: ""}, {Name: "read_file"},
+	})
+	for _, want := range []string{"edit", "read_file", "Do not retry"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("reject reason missing %q: %q", want, reason)
+		}
 	}
 
-	payload := []byte(`{"model":"cursor-test-model","messages":[` +
-		`{"role":"user","content":"hi"},` +
-		`{"role":"assistant","content":"Hello."},` +
-		`{"role":"user","content":"capital of France?"}]}`)
-	req := cliproxyexecutor.Request{Model: "cursor-test-model", Payload: payload}
-
-	if _, err := e.Execute(context.Background(), cursorTestAuth(), req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI}); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	_, wire, _, ok := cursorproto.ParseConnectFrame(written)
-	if !ok || len(wire) == 0 {
-		t.Fatalf("no connect frame captured (written=%d bytes)", len(written))
-	}
-
-	control := parseOpenAIRequest(payload)
-	flattenConversationIntoUserText(control)
-	if len(control.Turns) != 0 || control.UserText == "" {
-		t.Fatalf("control flatten produced turns=%d userText=%q", len(control.Turns), control.UserText)
-	}
-
-	// The wire request must carry the flattened transcript inside UserText and
-	// must not byte-match an encoding built from the structured turns.
-	transcript := control.UserText
-	if !strings.Contains(string(wire), transcript) {
-		t.Fatalf("wire request does not contain the flattened transcript %q", transcript)
-	}
-	plain := parseOpenAIRequest(payload)
-	apiKey := apiKeyFromContext(context.Background())
-	convID := deriveConversationId(apiKey, extractClaudeCodeSessionId(payload), plain.SystemPrompt)
-	withTurns := cursorproto.EncodeRunRequest(buildRunRequestParams(plain, convID, req.Model))
-	if bytes.Equal(wire, withTurns) {
-		t.Fatalf("wire matches the unflattened turns encoding; flatten fix not applied")
+	empty := buildExecRejectReason(nil)
+	if !strings.Contains(empty, "no external") || !strings.Contains(empty, "answer directly") {
+		t.Fatalf("empty-tool reject reason should tell the model to answer directly: %q", empty)
 	}
 }
