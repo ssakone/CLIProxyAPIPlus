@@ -1374,9 +1374,16 @@ func resultErrorFromError(err error) *Error {
 // shouldSkipCredentialCooldown reports failures that must not mark auth/model cooling.
 // Connection lifecycle is intentionally separate from request_scoped so transport
 // drops do not also stop credential rotation via isRequestInvalidError.
+// A locally detected empty completion is a heuristic verdict on one response, not
+// proof that the credential is unhealthy: the conductor still fails over to the
+// next auth within the same request, but the auth/model is not frozen for other
+// requests (a single-auth deployment would otherwise reject all traffic).
 func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
+	}
+	if err != nil && err.Code == errEmptyCompletion.Code {
+		return true
 	}
 	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
 }
