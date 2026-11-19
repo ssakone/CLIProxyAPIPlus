@@ -256,3 +256,50 @@ func TestCodexExecutorExecuteStream_EmptyStreamCompletionOutputUsesOutputItemDon
 		t.Fatalf("response.output[0].content[0].text = %q, want %q; completed=%s", gotContent, "ok", string(completed))
 	}
 }
+
+func TestCodexExecutorExecuteStreamPreservesSSEEventLineBoundaries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"OK"}` + "\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}],"usage":{"output_tokens":5}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-6-astra",
+		Payload: []byte(`{"model":"gpt-6-astra","input":"Reply with exactly OK.","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var joined bytes.Buffer
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		joined.Write(chunk.Payload)
+	}
+
+	got := joined.String()
+	for _, event := range []string{"response.created", "response.output_text.delta", "response.completed"} {
+		if !strings.Contains(got, "event: "+event+"\ndata: ") {
+			t.Fatalf("event %q merged with its data line; stream=%q", event, got)
+		}
+	}
+	if !strings.Contains(got, `data: {"type":"response.output_text.delta","delta":"OK"}`) {
+		t.Fatalf("output_text delta missing from stream: %q", got)
+	}
+}

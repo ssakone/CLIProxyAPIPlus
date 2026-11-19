@@ -1152,6 +1152,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
+			// Scanner removes line endings. Restore the boundary for SSE metadata
+			// so downstream consumers cannot merge an event field with the next
+			// data field into one opaque metadata line.
+			if isCodexSSEMetadataLine(line) {
+				translatedLine = append(translatedLine, '\n')
+			}
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
@@ -1207,6 +1213,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func isCodexSSEMetadataLine(line []byte) bool {
+	return bytes.HasPrefix(line, []byte("event:")) ||
+		bytes.HasPrefix(line, []byte("id:")) ||
+		bytes.HasPrefix(line, []byte("retry:")) ||
+		bytes.HasPrefix(line, []byte(":"))
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
